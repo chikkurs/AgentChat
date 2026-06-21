@@ -4,7 +4,10 @@ from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from dotenv import load_dotenv
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import PlainTextResponse
 import os
+
 
 load_dotenv()
 
@@ -61,3 +64,28 @@ def chat(request: ChatRequest):
     })
 
     return ChatResponse(answer=response)
+
+
+
+app = FastAPI()
+
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+
+
+@app.get("/webhook", response_class=PlainTextResponse)
+async def verify_webhook(
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
+    hub_challenge: str = Query(None, alias="hub.challenge")
+):
+    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
+        return hub_challenge
+
+    return "Verification failed"
+
+
+@app.post("/webhook")
+async def receive_message(request: Request):
+    body = await request.json()
+    print(body)
+    return {"status": "ok"}
