@@ -1,3 +1,5 @@
+from fastapi import FastAPI
+from pydantic import BaseModel
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -8,6 +10,12 @@ load_dotenv()
 
 hf_token = os.getenv("HUGGINGFACE_TOKEN")
 
+app = FastAPI(
+    title="LLM Chat API",
+    version="1.0.0"
+)
+
+# Initialize LLM
 llm = ChatHuggingFace(
     llm=HuggingFaceEndpoint(
         repo_id="meta-llama/Llama-3.1-8B-Instruct",
@@ -16,28 +24,40 @@ llm = ChatHuggingFace(
     )
 )
 
-chat_prompt = PromptTemplate(
+prompt = PromptTemplate(
     input_variables=["question"],
     template="""
-    You are a helpful AI assistant.
+You are a helpful AI assistant.
 
-    User Question: {question}
+User: {question}
 
-    Answer:
-    """
+Assistant:
+"""
 )
 
-chat_chain = chat_prompt | llm | StrOutputParser()
+chain = prompt | llm | StrOutputParser()
 
-while True:
-    question = input("\nYou: ")
 
-    if question.lower() in ["exit", "quit"]:
-        print("Goodbye!")
-        break
+class ChatRequest(BaseModel):
+    question: str
 
-    response = chat_chain.invoke({
-        "question": question
+
+class ChatResponse(BaseModel):
+    answer: str
+
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "running",
+        "service": "LLM Chat API"
+    }
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(request: ChatRequest):
+    response = chain.invoke({
+        "question": request.question
     })
 
-    print("\nBot:", response)
+    return ChatResponse(answer=response)
