@@ -67,7 +67,6 @@ def chat(request: ChatRequest):
 
 
 
-app = FastAPI()
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 
