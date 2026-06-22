@@ -52,3 +52,4 @@ uvicorn
 websockets
 xxhash
 zstandard
+python-multipart
