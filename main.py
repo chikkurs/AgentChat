@@ -230,7 +230,9 @@ If it contains tables, preserve them.
             "answer": answer
         }
     )
-
+@app.get("/health")
+def health():
+    return {"status": "deployment-test"}
 # =====================================================
 # MAIN
 # =====================================================
