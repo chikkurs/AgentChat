@@ -1,90 +1,244 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+import os
+import base64
+import shutil
+import uvicorn
+
+from dotenv import load_dotenv
+
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    UploadFile,
+    HTTPException
+)
+
+from fastapi.responses import JSONResponse
+
+from langchain_huggingface import (
+    ChatHuggingFace,
+    HuggingFaceEndpoint
+)
+
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from dotenv import load_dotenv
-from fastapi import FastAPI, Query, Request
-from fastapi.responses import PlainTextResponse
-import os
 
+from groq import Groq
+
+# =====================================================
+# ENV
+# =====================================================
 
 load_dotenv()
 
-hf_token = os.getenv("HUGGINGFACE_TOKEN")
+HF_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+if not HF_TOKEN:
+    raise Exception("HUGGINGFACE_TOKEN not found")
+
+if not GROQ_API_KEY:
+    raise Exception("GROQ_API_KEY not found")
+
+# =====================================================
+# APP
+# =====================================================
 
 app = FastAPI(
-    title="LLM Chat API",
-    version="1.0.0"
+    title="Multimodal AI Agent",
+    version="1.0"
 )
 
-# Initialize LLM
-llm = ChatHuggingFace(
+# =====================================================
+# UPLOAD DIRECTORY
+# =====================================================
+
+UPLOAD_DIR = "uploads"
+
+os.makedirs(
+    UPLOAD_DIR,
+    exist_ok=True
+)
+
+# =====================================================
+# TEXT MODEL
+# =====================================================
+
+text_model = ChatHuggingFace(
     llm=HuggingFaceEndpoint(
         repo_id="meta-llama/Llama-3.1-8B-Instruct",
-        huggingfacehub_api_token=hf_token,
+        huggingfacehub_api_token=HF_TOKEN,
         max_new_tokens=700
     )
 )
 
-prompt = PromptTemplate(
+chat_prompt = PromptTemplate(
     input_variables=["question"],
     template="""
 You are a helpful AI assistant.
 
-User: {question}
-
-Assistant:
+Question:
+{question}
 """
 )
 
-chain = prompt | llm | StrOutputParser()
+text_chain = (
+    chat_prompt
+    | text_model
+    | StrOutputParser()
+)
 
+# =====================================================
+# VISION MODEL (Groq)
+# =====================================================
 
-class ChatRequest(BaseModel):
-    question: str
+vision_client = Groq(api_key=GROQ_API_KEY)
 
+# =====================================================
+# TEXT CHAT
+# =====================================================
 
-class ChatResponse(BaseModel):
-    answer: str
+def ask_text_model(question: str):
 
-
-@app.get("/")
-def health_check():
-    return {
-        "status": "running",
-        "service": "LLM Chat API"
-    }
-
-
-@app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest):
-    response = chain.invoke({
-        "question": request.question
+    response = text_chain.invoke({
+        "question": question
     })
 
-    return ChatResponse(answer=response)
+    return response
 
+# =====================================================
+# IMAGE CHAT
+# =====================================================
 
-
-
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-
-
-@app.get("/webhook", response_class=PlainTextResponse)
-async def verify_webhook(
-    hub_mode: str = Query(None, alias="hub.mode"),
-    hub_verify_token: str = Query(None, alias="hub.verify_token"),
-    hub_challenge: str = Query(None, alias="hub.challenge")
+def ask_vision_model(
+    image_path: str,
+    question: str
 ):
-    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
-        return hub_challenge
 
-    return "Verification failed"
+    try:
 
+        with open(image_path, "rb") as img:
 
-@app.post("/webhook")
-async def receive_message(request: Request):
-    body = await request.json()
-    print(body)
-    return {"status": "ok"}
+            encoded_image = base64.b64encode(
+                img.read()
+            ).decode("utf-8")
+
+        response = vision_client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{encoded_image}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": question
+                        }
+                    ]
+                }
+            ]
+        )
+
+        return response.choices[0].message.content
+
+    except Exception as e:
+
+        return f"Vision Model Error: {str(e)}"
+
+# =====================================================
+# ROOT
+# =====================================================
+
+@app.get("/")
+def home():
+
+    return {
+        "message": "AI Agent Running"
+    }
+
+# =====================================================
+# CHAT ENDPOINT
+# =====================================================
+
+@app.post("/chat")
+async def chat(
+    question: str = Form(None),
+    image: UploadFile = File(None)
+):
+
+    if not question and not image:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Provide text or image"
+        )
+
+    # ==========================================
+    # IMAGE FLOW
+    # ==========================================
+
+    if image:
+
+        image_path = os.path.join(
+            UPLOAD_DIR,
+            image.filename
+        )
+
+        with open(
+            image_path,
+            "wb"
+        ) as buffer:
+
+            shutil.copyfileobj(
+                image.file,
+                buffer
+            )
+
+        answer = ask_vision_model(
+            image_path=image_path,
+            question=question or """
+Extract all text from this image.
+If it is a document, summarize it.
+If it contains tables, preserve them.
+"""
+        )
+
+        return JSONResponse(
+            content={
+                "type": "vision",
+                "answer": answer
+            }
+        )
+
+    # ==========================================
+    # TEXT FLOW
+    # ==========================================
+
+    answer = ask_text_model(
+        question
+    )
+
+    return JSONResponse(
+        content={
+            "type": "text",
+            "answer": answer
+        }
+    )
+
+# =====================================================
+# MAIN
+# =====================================================
+
+if __name__ == "__main__":
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000
+    )
