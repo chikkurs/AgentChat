@@ -12,7 +12,8 @@ from fastapi import (
     UploadFile,
     HTTPException
 )
-
+import requests
+from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from langchain_huggingface import (
@@ -39,7 +40,10 @@ if not HF_TOKEN:
 
 if not GROQ_API_KEY:
     raise Exception("GROQ_API_KEY not found")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+if not TELEGRAM_BOT_TOKEN:
+    raise Exception("TELEGRAM_BOT_TOKEN not found")
 # =====================================================
 # APP
 # =====================================================
@@ -233,9 +237,130 @@ If it contains tables, preserve them.
 @app.get("/health")
 def health():
     return {"status": "deployment-test"}
-# =====================================================
-# MAIN
-# =====================================================
+def send_telegram_message(chat_id: int, text: str):
+
+    requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text": text
+        },
+        timeout=30
+    )
+
+
+def download_telegram_file(file_id: str):
+
+    file_info = requests.get(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+        params={"file_id": file_id},
+        timeout=30
+    ).json()
+
+    file_path = file_info["result"]["file_path"]
+
+    download_url = (
+        f"https://api.telegram.org/file/bot"
+        f"{TELEGRAM_BOT_TOKEN}/{file_path}"
+    )
+
+    local_path = os.path.join(
+        UPLOAD_DIR,
+        os.path.basename(file_path)
+    )
+
+    response = requests.get(
+        download_url,
+        timeout=60
+    )
+
+    with open(local_path, "wb") as f:
+        f.write(response.content)
+
+    return local_path
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+
+    try:
+
+        data = await request.json()
+
+        if "message" not in data:
+            return {"status": "ignored"}
+
+        message = data["message"]
+
+        chat_id = message["chat"]["id"]
+
+        # ===============================
+        # TEXT MESSAGE
+        # ===============================
+
+        if "text" in message:
+
+            user_text = message["text"]
+
+            answer = ask_text_model(
+                user_text
+            )
+
+            send_telegram_message(
+                chat_id,
+                answer
+            )
+
+            return {"status": "success"}
+
+        # ===============================
+        # IMAGE MESSAGE
+        # ===============================
+
+        if "photo" in message:
+
+            photo_list = message["photo"]
+
+            largest_photo = photo_list[-1]
+
+            file_id = largest_photo["file_id"]
+
+            image_path = download_telegram_file(
+                file_id
+            )
+
+            caption = message.get(
+                "caption",
+                "Extract all text and explain the image."
+            )
+
+            answer = ask_vision_model(
+                image_path=image_path,
+                question=caption
+            )
+
+            send_telegram_message(
+                chat_id,
+                answer
+            )
+
+            return {"status": "success"}
+
+        send_telegram_message(
+            chat_id,
+            "Unsupported message type."
+        )
+
+        return {"status": "ignored"}
+
+    except Exception as e:
+
+        print("Telegram Error:", str(e))
+
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
 if __name__ == "__main__":
 
