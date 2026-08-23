@@ -113,13 +113,8 @@ text_model = ChatHuggingFace(
     )
 )
 
-chat_prompt = PromptTemplate(
-    input_variables=["history", "question"],
-    template="""You are a helpful AI assistant having a single-turn exchange.
-
-Use the previous conversation only when it is relevant to the current
-question. Do not claim to remember information that is not present in
-the conversation history. Do not invent further turns, timestamps, or
+WITH_HISTORY_TEMPLATE = """You are a helpful AI assistant having a
+single-turn exchange. Do not invent further turns, timestamps, or
 messages. Answer the current question once, then stop.
 
 Previous conversation:
@@ -128,11 +123,36 @@ Previous conversation:
 Current user question:
 {question}
 
-Assistant reply:""",
+Assistant reply:"""
+
+NO_HISTORY_TEMPLATE = """You are a helpful AI assistant. This is the
+start of a new conversation — there is no previous context. Do not
+invent further turns, timestamps, or messages. Answer the question
+once, then stop.
+
+Current user question:
+{question}
+
+Assistant reply:"""
+
+with_history_prompt = PromptTemplate(
+    input_variables=["history", "question"],
+    template=WITH_HISTORY_TEMPLATE,
 )
 
-text_chain = (
-    chat_prompt
+no_history_prompt = PromptTemplate(
+    input_variables=["question"],
+    template=NO_HISTORY_TEMPLATE,
+)
+
+with_history_chain = (
+    with_history_prompt
+    | text_model
+    | StrOutputParser()
+)
+
+no_history_chain = (
+    no_history_prompt
     | text_model
     | StrOutputParser()
 )
@@ -260,19 +280,26 @@ def ask_text_model(
         limit=CHAT_HISTORY_LIMIT,
     )
 
-    history_text = format_chat_history(
-        history_rows
-    )
+    # Only build/send a history section when real prior messages
+    # exist. Feeding the model a placeholder like "No previous
+    # conversation." tends to make small instruct models comment on
+    # the placeholder itself ("I don't have any context...") instead
+    # of just answering the question.
+    if history_rows:
+        history_text = format_chat_history(history_rows)
 
-    if not history_text or not history_text.strip():
-        history_text = "(no previous conversation)"
-
-    response = text_chain.invoke(
-        {
-            "history": history_text,
-            "question": question,
-        }
-    )
+        response = with_history_chain.invoke(
+            {
+                "history": history_text,
+                "question": question,
+            }
+        )
+    else:
+        response = no_history_chain.invoke(
+            {
+                "question": question,
+            }
+        )
 
     response = clean_model_output(str(response).strip())
 
@@ -836,6 +863,9 @@ async def telegram_webhook(request: Request):
         remove_file(image_path)
 
 
+# =====================================================
+# LOCAL DEVELOPMENT
+# =====================================================
 
 if __name__ == "__main__":
     uvicorn.run(
