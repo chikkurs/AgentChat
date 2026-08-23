@@ -260,7 +260,7 @@ def clean_model_output(text: str) -> str:
     meta_commentary_patterns = [
         r"(?i)^it seems like you'?re (starting a new conversation|referring to a previous message)[^.]*\.\s*",
         r"(?i)^i don'?t have (any )?(context|previous conversation)[^.]*\.\s*",
-        r"(?i)^there'?s no previous conversation[^.]*\.\s*",
+        r"(?i)^there'?s no previous conversation[^.]*\.\s* vimal",
     ]
 
     for pattern in meta_commentary_patterns:
