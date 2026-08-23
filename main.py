@@ -27,6 +27,15 @@ from langchain_core.output_parsers import StrOutputParser
 
 from groq import Groq
 
+from memory import (
+    delete_memory_entry,
+    delete_user_memory,
+    extract_memory_updates,
+    format_memory_for_prompt,
+    get_user_memory,
+    upsert_memory_entries,
+)
+
 
 # =====================================================
 # ENVIRONMENT VARIABLES
@@ -112,8 +121,35 @@ User message:
 Assistant reply:""",
 )
 
+chat_prompt_with_memory = PromptTemplate(
+    input_variables=["memory", "question"],
+    template="""You are a helpful AI assistant.
+
+Here is what you know about this user from previous conversations.
+Use it only if relevant to the current message; otherwise ignore it
+silently and never mention it.
+
+Known facts about the user:
+{memory}
+
+Reply naturally and directly to the user's message below. Do not
+invent further turns, fake timestamps, or fake usernames of your own.
+Answer once, then stop.
+
+User message:
+{question}
+
+Assistant reply:""",
+)
+
 text_chain = (
     chat_prompt
+    | text_model
+    | StrOutputParser()
+)
+
+text_chain_with_memory = (
+    chat_prompt_with_memory
     | text_model
     | StrOutputParser()
 )
@@ -125,6 +161,12 @@ text_chain = (
 
 vision_client = Groq(api_key=GROQ_API_KEY)
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+# Reuse the same Groq client for memory extraction — it's a small,
+# structured JSON task, so a fast/cheap model is enough even though
+# the main chat responses come from HuggingFace.
+groq_client = vision_client
+MEMORY_EXTRACTION_MODEL = "llama-3.1-8b-instant"
 
 
 # =====================================================
@@ -216,27 +258,59 @@ def clean_model_output(text: str) -> str:
 # TEXT CHAT (stateless, no memory)
 # =====================================================
 
-def ask_text_model(question: str) -> str:
+def ask_text_model(user_id: str, question: str) -> str:
     """
-    Call the text model with a single message. No history is loaded
-    or stored — every call is independent.
+    Call the text model, using synthesized memory (not raw chat
+    history) when available. After answering, asks a small model
+    whether this exchange contains any durable facts worth
+    remembering, and stores only those — never the raw transcript.
     """
 
+    user_id = str(user_id).strip()
     question = question.strip()
 
     if not question:
         raise ValueError("Question cannot be empty")
 
-    response = text_chain.invoke(
-        {
-            "question": question,
-        }
-    )
+    memory_rows = get_user_memory(user_id) if user_id else []
+    memory_text = format_memory_for_prompt(memory_rows)
+
+    if memory_text:
+        response = text_chain_with_memory.invoke(
+            {
+                "memory": memory_text,
+                "question": question,
+            }
+        )
+    else:
+        response = text_chain.invoke(
+            {
+                "question": question,
+            }
+        )
 
     response = clean_model_output(str(response).strip())
 
     if not response:
         response = "I could not generate a response."
+
+    if user_id:
+        try:
+            updates = extract_memory_updates(
+                groq_client=groq_client,
+                model=MEMORY_EXTRACTION_MODEL,
+                question=question,
+                answer=response,
+                existing_memory_rows=memory_rows,
+            )
+
+            if updates:
+                upsert_memory_entries(user_id, updates)
+
+        except Exception as exc:
+            # Memory extraction is best-effort. A failure here must
+            # never break the actual chat response.
+            print("Memory extraction skipped due to error:", str(exc))
 
     return response
 
@@ -324,16 +398,26 @@ def health():
 
 @app.post("/chat")
 async def chat(
+    user_id: str = Form(...),
     question: str | None = Form(None),
     image: UploadFile | None = File(None),
 ):
     """
     Handle text-only and image-based chat requests.
 
-    Stateless: no conversation memory is loaded or stored.
+    user_id is used only to key synthesized long-term memory (facts
+    like name, role, preferences) — not to store raw conversation
+    history.
     """
 
+    user_id = user_id.strip()
     question = question.strip() if question else None
+
+    if not user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="user_id cannot be empty",
+        )
 
     if not question and not image:
         raise HTTPException(
@@ -382,7 +466,10 @@ async def chat(
                 }
             )
 
-        answer = ask_text_model(question or "")
+        answer = ask_text_model(
+            user_id=user_id,
+            question=question or "",
+        )
 
         return JSONResponse(
             content={
@@ -408,6 +495,78 @@ async def chat(
             await image.close()
 
         remove_file(image_path)
+
+
+# =====================================================
+# MEMORY API
+# =====================================================
+
+@app.get("/memory/{user_id}")
+def view_memory(user_id: str):
+    """
+    View all synthesized memory entries stored for a user.
+    """
+
+    user_id = user_id.strip()
+
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id cannot be empty")
+
+    rows = get_user_memory(user_id)
+
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "memory": [
+            {"category": category, "entry": entry}
+            for category, entry in rows
+        ],
+    }
+
+
+@app.delete("/memory/{user_id}")
+def delete_all_user_memory(user_id: str):
+    """
+    Delete all memory entries for one user.
+    """
+
+    user_id = user_id.strip()
+
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id cannot be empty")
+
+    deleted_count = delete_user_memory(user_id)
+
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "deleted_entries": deleted_count,
+    }
+
+
+@app.delete("/memory/{user_id}/{category}")
+def delete_one_memory_entry(user_id: str, category: str):
+    """
+    Delete a single memory category for one user (e.g. just "name").
+    """
+
+    user_id = user_id.strip()
+    category = category.strip()
+
+    if not user_id or not category:
+        raise HTTPException(
+            status_code=400,
+            detail="user_id and category cannot be empty",
+        )
+
+    deleted_count = delete_memory_entry(user_id, category)
+
+    return {
+        "status": "success",
+        "user_id": user_id,
+        "category": category,
+        "deleted_entries": deleted_count,
+    }
 
 
 # =====================================================
@@ -540,6 +699,8 @@ async def telegram_webhook(request: Request):
                 "reason": "No chat ID found",
             }
 
+        user_id = str(chat_id)
+
         # =============================================
         # TEXT MESSAGE
         # =============================================
@@ -565,8 +726,10 @@ async def telegram_webhook(request: Request):
                     chat_id,
                     (
                         "Hello! Send me a text message or an image.\n\n"
-                        "Each message is answered independently — "
-                        "I don't remember previous messages."
+                        "Commands:\n"
+                        "/memory - see what I remember about you\n"
+                        "/forget - clear everything I remember about you\n"
+                        "/help - show this help message"
                     ),
                 )
 
@@ -574,7 +737,42 @@ async def telegram_webhook(request: Request):
                     "status": "success",
                 }
 
-            answer = ask_text_model(user_text)
+            if user_text.lower() == "/memory":
+                rows = get_user_memory(user_id)
+
+                if not rows:
+                    send_telegram_message(
+                        chat_id,
+                        "I don't have anything saved about you yet.",
+                    )
+                else:
+                    lines = [f"- {category}: {entry}" for category, entry in rows]
+                    send_telegram_message(
+                        chat_id,
+                        "Here's what I remember about you:\n" + "\n".join(lines),
+                    )
+
+                return {
+                    "status": "success",
+                }
+
+            if user_text.lower() == "/forget":
+                deleted_count = delete_user_memory(user_id)
+
+                send_telegram_message(
+                    chat_id,
+                    f"Cleared. Deleted {deleted_count} remembered fact(s).",
+                )
+
+                return {
+                    "status": "success",
+                    "deleted_entries": deleted_count,
+                }
+
+            answer = ask_text_model(
+                user_id=user_id,
+                question=user_text,
+            )
 
             send_telegram_message(
                 chat_id,
