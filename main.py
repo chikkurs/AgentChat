@@ -113,11 +113,21 @@ text_model = ChatHuggingFace(
     )
 )
 
-WITH_HISTORY_TEMPLATE = """You are a helpful AI assistant having a
-single-turn exchange. Do not invent further turns, timestamps, or
-messages. Answer the current question once, then stop.
+CHAT_TEMPLATE = """You are a helpful AI assistant.
 
-Previous conversation:
+Below is the previous conversation history, if any exists. Use it only
+when it is actually relevant to answering the current question. If the
+history is empty or unrelated, simply ignore it and answer the current
+question normally, as you would in any first message.
+
+Never comment on whether history is present, missing, or empty. Never
+say things like "I don't have any context", "there's no previous
+conversation", or "you're starting a new conversation". Do not mention
+memory, context, or history at all in your reply — just answer the
+question directly and naturally. Do not invent further turns,
+timestamps, or messages of your own. Answer once, then stop.
+
+Previous conversation history:
 {history}
 
 Current user question:
@@ -125,34 +135,13 @@ Current user question:
 
 Assistant reply:"""
 
-NO_HISTORY_TEMPLATE = """You are a helpful AI assistant. This is the
-start of a new conversation — there is no previous context. Do not
-invent further turns, timestamps, or messages. Answer the question
-once, then stop.
-
-Current user question:
-{question}
-
-Assistant reply:"""
-
-with_history_prompt = PromptTemplate(
+chat_prompt = PromptTemplate(
     input_variables=["history", "question"],
-    template=WITH_HISTORY_TEMPLATE,
+    template=CHAT_TEMPLATE,
 )
 
-no_history_prompt = PromptTemplate(
-    input_variables=["question"],
-    template=NO_HISTORY_TEMPLATE,
-)
-
-with_history_chain = (
-    with_history_prompt
-    | text_model
-    | StrOutputParser()
-)
-
-no_history_chain = (
-    no_history_prompt
+text_chain = (
+    chat_prompt
     | text_model
     | StrOutputParser()
 )
@@ -251,7 +240,22 @@ def clean_model_output(text: str) -> str:
         if match and match.start() < earliest_cut:
             earliest_cut = match.start()
 
-    return text[:earliest_cut].strip()
+    text = text[:earliest_cut].strip()
+
+    # Strip stray meta-commentary sentences about memory/context if the
+    # model ignores the instruction not to produce them. This is a
+    # best-effort net, not a guarantee — the prompt instruction is the
+    # primary defense.
+    meta_commentary_patterns = [
+        r"(?i)^it seems like you'?re (starting a new conversation|referring to a previous message)[^.]*\.\s*",
+        r"(?i)^i don'?t have (any )?(context|previous conversation)[^.]*\.\s*",
+        r"(?i)^there'?s no previous conversation[^.]*\.\s*",
+    ]
+
+    for pattern in meta_commentary_patterns:
+        text = re.sub(pattern, "", text).strip()
+
+    return text
 
 
 # =====================================================
@@ -280,26 +284,17 @@ def ask_text_model(
         limit=CHAT_HISTORY_LIMIT,
     )
 
-    # Only build/send a history section when real prior messages
-    # exist. Feeding the model a placeholder like "No previous
-    # conversation." tends to make small instruct models comment on
-    # the placeholder itself ("I don't have any context...") instead
-    # of just answering the question.
-    if history_rows:
-        history_text = format_chat_history(history_rows)
+    history_text = format_chat_history(history_rows)
 
-        response = with_history_chain.invoke(
-            {
-                "history": history_text,
-                "question": question,
-            }
-        )
-    else:
-        response = no_history_chain.invoke(
-            {
-                "question": question,
-            }
-        )
+    if not history_text or not history_text.strip():
+        history_text = "(empty — this is the first message, no prior turns exist)"
+
+    response = text_chain.invoke(
+        {
+            "history": history_text,
+            "question": question,
+        }
+    )
 
     response = clean_model_output(str(response).strip())
 
