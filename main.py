@@ -100,7 +100,7 @@ STOP_SEQUENCES = [
     "\nAssistant:",
     "\nCurrent user question:",
     "\nPrevious conversation:",
-    "\n[",          # blocks "[23-08-2026 20:26] ..." style hallucinations
+    "\n[",        
 ]
 
 text_model = ChatHuggingFace(
@@ -113,21 +113,12 @@ text_model = ChatHuggingFace(
     )
 )
 
-CHAT_TEMPLATE = """You are a helpful AI assistant.
+CHAT_TEMPLATE_WITH_HISTORY = """You are a helpful AI assistant.
 
-Below is the previous conversation history, if any exists. Use it only
-when it is actually relevant to answering the current question. If the
-history is empty or unrelated, simply ignore it and answer the current
-question normally, as you would in any first message.
+Below is the recent conversation history. Use it only if it is
+relevant to the current question; otherwise ignore it.
 
-Never comment on whether history is present, missing, or empty. Never
-say things like "I don't have any context", "there's no previous
-conversation", or "you're starting a new conversation". Do not mention
-memory, context, or history at all in your reply — just answer the
-question directly and naturally. Do not invent further turns,
-timestamps, or messages of your own. Answer once, then stop.
-
-Previous conversation history:
+Conversation history:
 {history}
 
 Current user question:
@@ -135,13 +126,33 @@ Current user question:
 
 Assistant reply:"""
 
-chat_prompt = PromptTemplate(
+CHAT_TEMPLATE_NO_HISTORY = """You are a helpful AI assistant.
+
+Answer the user's message naturally and directly.
+
+User message:
+{question}
+
+Assistant reply:"""
+
+with_history_prompt = PromptTemplate(
     input_variables=["history", "question"],
-    template=CHAT_TEMPLATE,
+    template=CHAT_TEMPLATE_WITH_HISTORY,
 )
 
-text_chain = (
-    chat_prompt
+no_history_prompt = PromptTemplate(
+    input_variables=["question"],
+    template=CHAT_TEMPLATE_NO_HISTORY,
+)
+
+with_history_chain = (
+    with_history_prompt
+    | text_model
+    | StrOutputParser()
+)
+
+no_history_chain = (
+    no_history_prompt
     | text_model
     | StrOutputParser()
 )
@@ -284,17 +295,28 @@ def ask_text_model(
         limit=CHAT_HISTORY_LIMIT,
     )
 
-    history_text = format_chat_history(history_rows)
+    # Only include a "history" section in the prompt when real prior
+    # messages actually exist. A small 8B instruct model cannot be
+    # reliably told (via instructions alone) to stay silent about an
+    # empty/placeholder history — it tends to narrate it anyway
+    # ("I don't have any context..."). Structurally omitting the
+    # section on the first message removes the cue entirely, which is
+    # far more reliable than prompting around it.
+    if history_rows:
+        history_text = format_chat_history(history_rows)
 
-    if not history_text or not history_text.strip():
-        history_text = "(empty — this is the first message, no prior turns exist)"
-
-    response = text_chain.invoke(
-        {
-            "history": history_text,
-            "question": question,
-        }
-    )
+        response = with_history_chain.invoke(
+            {
+                "history": history_text,
+                "question": question,
+            }
+        )
+    else:
+        response = no_history_chain.invoke(
+            {
+                "question": question,
+            }
+        )
 
     response = clean_model_output(str(response).strip())
 
