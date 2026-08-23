@@ -258,6 +258,8 @@ def clean_model_output(text: str) -> str:
 # TEXT CHAT (stateless, no memory)
 # =====================================================
 
+
+
 def ask_text_model(user_id: str, question: str) -> str:
     """
     Call the text model, using synthesized memory (not raw chat
