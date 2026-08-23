@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 import shutil
 import uuid
@@ -64,7 +65,7 @@ app = FastAPI(
         "Text and image chatbot with PostgreSQL conversation memory "
         "and Telegram integration."
     ),
-    version="2.0.0",
+    version="2.0.1",
 )
 
 
@@ -82,6 +83,25 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # =====================================================
 # TEXT MODEL
 # =====================================================
+#
+# IMPORTANT: stop_sequences is the key fix here. Without it, the model
+# has no signal to stop after answering, and — because it has seen huge
+# volumes of chat-log-style text in training (WhatsApp exports, support
+# transcripts, etc.) — it will keep generating tokens up to
+# max_new_tokens and often hallucinates a *fake continuation* of the
+# conversation: a new timestamp, a fake user id, a fake reply from
+# itself. That hallucinated block was previously getting saved into
+# memory too, which made the problem compound over time.
+
+STOP_SEQUENCES = [
+    "\nUser:",
+    "\nUser ",
+    "\nHuman:",
+    "\nAssistant:",
+    "\nCurrent user question:",
+    "\nPrevious conversation:",
+    "\n[",          # blocks "[23-08-2026 20:26] ..." style hallucinations
+]
 
 text_model = ChatHuggingFace(
     llm=HuggingFaceEndpoint(
@@ -89,19 +109,18 @@ text_model = ChatHuggingFace(
         huggingfacehub_api_token=HF_TOKEN,
         max_new_tokens=700,
         temperature=0.3,
+        stop_sequences=STOP_SEQUENCES,
     )
 )
 
 chat_prompt = PromptTemplate(
     input_variables=["history", "question"],
-    template="""
-You are a helpful AI assistant.
+    template="""You are a helpful AI assistant having a single-turn exchange.
 
 Use the previous conversation only when it is relevant to the current
-question.
-
-Do not claim to remember information that is not present in the
-conversation history.
+question. Do not claim to remember information that is not present in
+the conversation history. Do not invent further turns, timestamps, or
+messages. Answer the current question once, then stop.
 
 Previous conversation:
 {history}
@@ -109,8 +128,7 @@ Previous conversation:
 Current user question:
 {question}
 
-Assistant:
-""",
+Assistant reply:""",
 )
 
 text_chain = (
@@ -183,6 +201,39 @@ def get_image_mime_type(image_path: str) -> str:
     return mime_types.get(extension, "image/jpeg")
 
 
+def clean_model_output(text: str) -> str:
+    """
+    Defensive cleanup in case the model still slips a hallucinated
+    continuation past the stop sequences (e.g. if it generates a
+    variant spelling/spacing the stop list doesn't cover).
+
+    This trims the response at the first sign of a fabricated new
+    turn, timestamp, or role label, so garbage never reaches the user
+    or gets written into memory.
+    """
+
+    if not text:
+        return text
+
+    cut_patterns = [
+        r"\n\[\d{1,2}[-/]\d{1,2}[-/]\d{2,4}",  # "[23-08-2026 ..." log style
+        r"\n\s*User\s*[:\-]",
+        r"\n\s*Human\s*[:\-]",
+        r"\n\s*Assistant\s*[:\-]",
+        r"\n\s*AgentChat\s*[:\-]",
+        r"\n\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\s*:",  # fake IP-style sender
+    ]
+
+    earliest_cut = len(text)
+
+    for pattern in cut_patterns:
+        match = re.search(pattern, text)
+        if match and match.start() < earliest_cut:
+            earliest_cut = match.start()
+
+    return text[:earliest_cut].strip()
+
+
 # =====================================================
 # TEXT CHAT WITH MEMORY
 # =====================================================
@@ -213,6 +264,9 @@ def ask_text_model(
         history_rows
     )
 
+    if not history_text or not history_text.strip():
+        history_text = "(no previous conversation)"
+
     response = text_chain.invoke(
         {
             "history": history_text,
@@ -220,11 +274,13 @@ def ask_text_model(
         }
     )
 
-    response = str(response).strip()
+    response = clean_model_output(str(response).strip())
 
     if not response:
         response = "I could not generate a response."
 
+    # Only ever save the sanitized response — never the raw model
+    # output — so hallucinated turns can't leak into future context.
     save_message(
         user_id=user_id,
         role="user",
@@ -294,7 +350,7 @@ def ask_vision_model(
     if not answer:
         return "I could not analyze the image."
 
-    return str(answer).strip()
+    return clean_model_output(str(answer).strip())
 
 
 def ask_vision_model_with_memory(
@@ -339,7 +395,7 @@ def ask_vision_model_with_memory(
 def home():
     return {
         "message": "Multimodal AI Agent is running",
-        "version": "2.0.0",
+        "version": "2.0.1",
         "docs": "/docs",
     }
 
@@ -780,9 +836,6 @@ async def telegram_webhook(request: Request):
         remove_file(image_path)
 
 
-# =====================================================
-# LOCAL DEVELOPMENT
-# =====================================================
 
 if __name__ == "__main__":
     uvicorn.run(
