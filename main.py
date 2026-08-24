@@ -1,10 +1,12 @@
 import os
 import re
+import asyncio
 import base64
 import shutil
 import uuid
 import uvicorn
 import requests
+from collections import defaultdict
 
 from dotenv import load_dotenv
 
@@ -27,6 +29,7 @@ from langchain_core.output_parsers import StrOutputParser
 
 from groq import Groq
 
+from db import check_db_connection
 from memory import (
     delete_memory_entry,
     delete_user_memory,
@@ -71,6 +74,11 @@ app = FastAPI(
 )
 
 
+@app.on_event("startup")
+def on_startup():
+    check_db_connection()
+
+
 # =====================================================
 # CONFIGURATION
 # =====================================================
@@ -79,6 +87,18 @@ UPLOAD_DIR = "uploads"
 TELEGRAM_MESSAGE_LIMIT = 4000
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Per-user locks so that messages from the same user are always
+# fully processed (including memory read + write) one at a time, in
+# order. Without this, two quick messages from the same user can run
+# concurrently — the second one can read memory before the first one
+# has finished writing to it, making memory look like it "forgot"
+# something that was just said.
+_user_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+def get_user_lock(user_id: str) -> asyncio.Lock:
+    return _user_locks[str(user_id)]
 
 
 # =====================================================
@@ -258,8 +278,6 @@ def clean_model_output(text: str) -> str:
 # TEXT CHAT (stateless, no memory)
 # =====================================================
 
-
-
 def ask_text_model(user_id: str, question: str) -> str:
     """
     Call the text model, using synthesized memory (not raw chat
@@ -274,7 +292,18 @@ def ask_text_model(user_id: str, question: str) -> str:
     if not question:
         raise ValueError("Question cannot be empty")
 
-    memory_rows = get_user_memory(user_id) if user_id else []
+    memory_rows = []
+
+    if user_id:
+        try:
+            memory_rows = get_user_memory(user_id)
+        except Exception as exc:
+            # If memory lookup fails (e.g. table missing, DB
+            # unreachable), degrade gracefully to a stateless reply
+            # instead of failing the whole request.
+            print("Memory lookup skipped due to error:", str(exc))
+            memory_rows = []
+
     memory_text = format_memory_for_prompt(memory_rows)
 
     if memory_text:
@@ -858,6 +887,18 @@ async def telegram_webhook(request: Request):
 
     except Exception as exc:
         print("Telegram Webhook Error:", str(exc))
+
+        # Best-effort: let the user know something went wrong instead
+        # of leaving them with total silence. If chat_id was never
+        # resolved, there's nowhere to send this, so it's skipped.
+        try:
+            if "chat_id" in locals() and chat_id is not None:
+                send_telegram_message(
+                    chat_id,
+                    "Something went wrong on my end. Please try again.",
+                )
+        except Exception as notify_exc:
+            print("Failed to notify user of error:", str(notify_exc))
 
         return JSONResponse(
             status_code=500,
