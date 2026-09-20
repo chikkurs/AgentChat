@@ -72,7 +72,10 @@ while True:
             if "text" in message:
                 response = requests.post(
                     "http://127.0.0.1:8000/chat",
-                    data={"question": message["text"]},
+                    data={
+                        "user_id": str(chat_id),
+                        "question": message["text"],
+                    },
                     timeout=180
                 )
 
@@ -91,8 +94,17 @@ while True:
                 with open(image_path, "rb") as img:
                     response = requests.post(
                         "http://127.0.0.1:8000/chat",
-                        data={"question": question},
-                        files={"image": img},
+                        data={
+                            "user_id": str(chat_id),
+                            "question": question,
+                        },
+                        files={
+                            "image": (
+                                os.path.basename(image_path),
+                                img,
+                                "image/jpeg",
+                            )
+                        },
                         timeout=180
                     )
 

@@ -180,7 +180,7 @@ text_chain_with_memory = (
 # =====================================================
 
 vision_client = Groq(api_key=GROQ_API_KEY)
-VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+VISION_MODEL = "llama-3.2-11b-vision-preview"
 
 # Reuse the same Groq client for memory extraction — it's a small,
 # structured JSON task, so a fast/cheap model is enough even though
@@ -460,9 +460,15 @@ async def chat(
 
     try:
         if image:
-            if not image.content_type or not image.content_type.startswith(
-                "image/"
-            ):
+            is_image_type = bool(
+                (image.content_type and image.content_type.startswith("image/"))
+                or (
+                    image.filename
+                    and os.path.splitext(image.filename)[1].lower()
+                    in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+                )
+            )
+            if not is_image_type:
                 raise HTTPException(
                     status_code=400,
                     detail="Uploaded file must be an image",
@@ -518,8 +524,8 @@ async def chat(
 
         raise HTTPException(
             status_code=500,
-            detail=f"Unable to process the request: {str(exc)}",
-        ) from exc
+            detail=str(exc),
+        )
 
     finally:
         if image:
