@@ -350,6 +350,37 @@ def ask_text_model(user_id: str, question: str) -> str:
 # IMAGE CHAT (stateless, no memory)
 # =====================================================
 
+def get_active_vision_models() -> list[str]:
+    """
+    Dynamically discover active vision-capable models from Groq API.
+    """
+    preferred_order = [
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "llama-3.2-11b-vision-preview",
+        "llama-3.2-90b-vision-preview",
+        "llava-v1.5-7b-4096",
+    ]
+    try:
+        available_data = vision_client.models.list().data
+        available_ids = [m.id for m in available_data]
+
+        matched = [m for m in preferred_order if m in available_ids]
+
+        for m_id in available_ids:
+            if m_id not in matched and any(
+                k in m_id.lower()
+                for k in ["vision", "scout", "llava", "multimodal"]
+            ):
+                matched.append(m_id)
+
+        if matched:
+            return matched
+    except Exception as exc:
+        print("Could not query Groq models list:", str(exc))
+
+    return [VISION_MODEL] + preferred_order
+
+
 def ask_vision_model(
     image_path: str,
     question: str,
@@ -370,37 +401,51 @@ def ask_vision_model(
             image_file.read()
         ).decode("utf-8")
 
-    response = vision_client.chat.completions.create(
-        model=VISION_MODEL,
-        max_tokens=1024,
-        messages=[
-            {
-                "role": "user",
-                "content": [
+    models_to_try = get_active_vision_models()
+    last_exception = None
+
+    for model_name in models_to_try:
+        try:
+            response = vision_client.chat.completions.create(
+                model=model_name,
+                max_tokens=1024,
+                messages=[
                     {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": (
-                                f"data:{mime_type};"
-                                f"base64,{encoded_image}"
-                            )
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": question,
-                    },
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": (
+                                        f"data:{mime_type};"
+                                        f"base64,{encoded_image}"
+                                    )
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": question,
+                            },
+                        ],
+                    }
                 ],
-            }
-        ],
-    )
+            )
 
-    answer = response.choices[0].message.content
+            answer = response.choices[0].message.content
 
-    if not answer:
-        return "I could not analyze the image."
+            if not answer:
+                return "I could not analyze the image."
 
-    return clean_model_output(str(answer).strip())
+            return clean_model_output(str(answer).strip())
+
+        except Exception as exc:
+            print(f"Vision model '{model_name}' failed: {exc}")
+            last_exception = exc
+
+    if last_exception:
+        raise last_exception
+
+    return "Unable to process image."
 
 
 # =====================================================
